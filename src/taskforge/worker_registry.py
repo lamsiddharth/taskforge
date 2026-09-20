@@ -1,122 +1,81 @@
-import os
 import time
 from contextlib import contextmanager
 
 import redis
-from dotenv import load_dotenv
 
-load_dotenv()
-
-HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", 5))
-
-# Invariant: REAP_AFTER > DEAD_AFTER > HEARTBEAT_INTERVAL * 2
-# DEAD_AFTER tolerates 3 consecutive missed heartbeats before accusing a worker,
-# so a GC pause or network blip doesn't get a healthy worker declared dead.
-# REAP_AFTER leaves a window where a dead worker's record is still readable,
-# so a recovery pass can see its last known `status` before the key disappears.
-DEAD_AFTER = HEARTBEAT_INTERVAL * 3
-REAP_AFTER = HEARTBEAT_INTERVAL * 7
+from taskforge.config import settings
 
 
 class WorkerRegistry:
-    """Redis-backed view of which workers exist and what they're doing.
+    """Redis-backed liveness for workers.
 
-    Two fields per worker, both written only by the worker itself:
-      status          -- "idle" | "busy"
-      last_heartbeat  -- unix timestamp
+    Liveness is TTL-as-liveness: a worker refreshes its key on an interval, and
+    the key existing IS the worker being alive. A dead worker's record never
+    needs deleting -- expiry does it. Same mechanism as Consul/etcd session
+    leases.
 
-    Liveness is deliberately NOT stored. It is derived from last_heartbeat on
-    read, so it cannot go stale and no second writer can corrupt it.
+    This works because the crash forensics live in Postgres, not here. The
+    tasks table records which worker claimed which task, so letting the Redis
+    key vanish loses nothing recoverable.
+
+    TTL is heartbeat_interval * 3 (see config): one dropped packet must not be
+    enough to declare a healthy worker dead.
     """
 
     def __init__(self):
         self.redis_client = redis.StrictRedis(
-            host="localhost", port=6379, db=0, socket_timeout=None
+            host=settings.redis_host,
+            port=settings.redis_port,
+            db=settings.redis_db,
+            socket_timeout=None,
         )
 
-    def _key(self, worker_id: str) -> str:
+    def _alive_key(self, worker_id: str) -> str:
+        return f"worker:{worker_id}:alive"
+
+    def _meta_key(self, worker_id: str) -> str:
         return f"worker:{worker_id}"
 
     def register_worker(self, worker_id: str) -> None:
+        self.touch(worker_id)
         self.redis_client.hset(
-            self._key(worker_id),
-            mapping={"status": "idle", "last_heartbeat": time.time()},
+            self._meta_key(worker_id),
+            mapping={"status": "idle", "registered_at": time.time()},
         )
-
-    def update_worker_status(self, worker_id: str, status: str) -> None:
-        self.redis_client.hset(
-            self._key(worker_id),
-            mapping={"status": status, "last_heartbeat": time.time()},
-        )
+        self.redis_client.expire(self._meta_key(worker_id), settings.worker_ttl)
 
     def touch(self, worker_id: str) -> None:
-        """Refresh only the heartbeat timestamp, leaving status untouched."""
-        self.redis_client.hset(
-            self._key(worker_id), mapping={"last_heartbeat": time.time()}
+        """Refresh the liveness lease. Must be called more often than the TTL."""
+        self.redis_client.set(
+            self._alive_key(worker_id), "1", ex=settings.worker_ttl
         )
-
-    def get_worker_status(self, worker_id: str):
-        return self.redis_client.hgetall(self._key(worker_id))
+        # Keep metadata alive alongside the lease so the two expire together.
+        self.redis_client.expire(self._meta_key(worker_id), settings.worker_ttl)
 
     def is_alive(self, worker_id: str) -> bool:
-        """Derive liveness from the last heartbeat. Never reads a stored flag."""
-        raw = self.redis_client.hget(self._key(worker_id), "last_heartbeat")
-        if raw is None:
-            return False
-        try:
-            return (time.time() - float(raw)) < DEAD_AFTER
-        except ValueError:
-            return False
+        """Liveness is key existence -- nothing stored, nothing to go stale."""
+        return bool(self.redis_client.exists(self._alive_key(worker_id)))
 
-    def _scan_workers(self):
-        """Yield (worker_id, status, age_seconds) for every registered worker.
+    def update_worker_status(self, worker_id: str, status: str) -> None:
+        self.redis_client.hset(self._meta_key(worker_id), "status", status)
+        self.redis_client.expire(self._meta_key(worker_id), settings.worker_ttl)
 
-        Skips keys that vanish or are malformed mid-scan -- a key can be deleted
-        between SCAN yielding it and the read below, so absence is expected here,
-        not exceptional.
-        """
-        now = time.time()
-        for key in self.redis_client.scan_iter("worker:*"):
-            status, heartbeat = self.redis_client.hmget(
-                key, "status", "last_heartbeat"
-            )
-            if heartbeat is None:
-                continue
-            try:
-                age = now - float(heartbeat)
-            except ValueError:
-                continue
-            worker_id = key.decode().split(":", 1)[1]
-            yield worker_id, (status.decode() if status else None), age
+    def get_worker_status(self, worker_id: str) -> dict:
+        return self.redis_client.hgetall(self._meta_key(worker_id))
 
-    def get_dead_workers(self) -> list[tuple[str, str | None]]:
-        """Workers that have missed enough heartbeats to be considered dead.
-
-        Returns (worker_id, last_known_status). A dead worker whose status is
-        still "busy" crashed mid-task -- that is the signal a recovery pass
-        needs, which is why nothing overwrites status.
-        """
+    def list_live_workers(self) -> list[str]:
+        """Every worker whose lease is unexpired. Self-cleaning by construction."""
         return [
-            (worker_id, status)
-            for worker_id, status, age in self._scan_workers()
-            if age > DEAD_AFTER
+            key.decode().split(":")[1]
+            for key in self.redis_client.scan_iter("worker:*:alive")
         ]
-
-    def reap_dead_workers(self) -> list[str]:
-        """Delete records of workers dead long enough to be beyond recovery."""
-        reaped = []
-        for worker_id, _status, age in self._scan_workers():
-            if age > REAP_AFTER:
-                self.redis_client.delete(self._key(worker_id))
-                reaped.append(worker_id)
-        return reaped
 
     @contextmanager
     def worker_context(self, worker_id: str):
         """Mark busy for the duration of the block, idle on the way out.
 
-        The finally clause matters: if the task raises, status still returns to
-        idle instead of leaving the worker permanently marked busy.
+        The finally matters: if the task raises, status still returns to idle
+        rather than leaving the worker permanently marked busy.
         """
         self.update_worker_status(worker_id, "busy")
         try:

@@ -1,23 +1,47 @@
-from dataclasses import dataclass, field
-from enum import Enum
-
-from typing import Optional
 import uuid
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Optional
+
+
+def utcnow() -> datetime:
+    """Timezone-aware UTC now.
+
+    Never use datetime.now() -- it returns a naive datetime in local time.
+    The scheduler compares "is this due yet?" across processes that may sit in
+    different timezones, and naive local times make that comparison meaningless.
+    DST also shifts local time twice a year while UTC keeps ticking.
+
+    Rule: store UTC always, convert to local only for display.
+    """
+    return datetime.now(timezone.utc)
+
 
 def handle_serialization(obj):
-    if(isinstance(obj, datetime)):
+    if isinstance(obj, datetime):
         return obj.isoformat()
-    if(isinstance(obj, Enum)):
-            return obj.value
+    if isinstance(obj, Enum):
+        return obj.value
     raise TypeError(f"Type {type(obj)} not serializable")
 
+
 def task_decoder(dct):
-    if 'task_status' in dct and 'task_priority' in dct and 'task_type' in dct and 'payload' in dct:
-        if 'created_at' in dct:
-                dct['created_at'] = datetime.fromisoformat(dct['created_at'])
-                return Task(**dct)
-    return dct
+    """json.loads object_hook -- rebuilds a Task from its JSON form.
+
+    Called for every JSON object in the document, including nested payloads,
+    so it must only claim dicts that actually look like a Task.
+    """
+    if not {"task_status", "task_priority", "task_type", "payload"} <= dct.keys():
+        return dct
+
+    if isinstance(dct.get("created_at"), str):
+        dct["created_at"] = datetime.fromisoformat(dct["created_at"])
+    if isinstance(dct.get("task_status"), str):
+        dct["task_status"] = TaskStatus(dct["task_status"])
+
+    return Task(**dct)
+
 
 class TaskStatus(Enum):
     PENDING = "pending"
@@ -25,14 +49,38 @@ class TaskStatus(Enum):
     COMPLETED = "completed"
     FAILED = "failed"
 
+
 @dataclass
 class Task:
     task_priority: str
     task_type: str
     payload: dict
-    task_status: TaskStatus = field(default=TaskStatus.PENDING)
-    created_at: datetime = field(default_factory=lambda: datetime.now())
+    task_status: TaskStatus = TaskStatus.PENDING
+    created_at: datetime = field(default_factory=utcnow)
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
     task_name: Optional[str] = None
     task_description: Optional[str] = None
+    # Set when a worker claims the task. Together with IN_PROGRESS this is how
+    # a crashed worker is detected: without it, a crash is indistinguishable
+    # from a slow task.
+    worker_id: Optional[str] = None
 
+def row_to_task(row) -> Task:
+    """Convert a SQLAlchemy row to a Task dataclass.
+
+    The row is the DB's representation of a task, and the dataclass is the
+    internal representation. They are two representations of one entity, and
+    silently letting them disagree is how stale reads happen. Callers should
+    use the return value.
+    """
+    return Task(
+        id=str(row.id),
+        task_name=row.task_name,
+        task_description=row.task_description,
+        task_status=TaskStatus(row.task_status),
+        task_priority=row.task_priority,
+        task_type=row.task_type,
+        payload=row.payload,
+        created_at=row.created_at,
+        worker_id=row.worker_id,
+    )
