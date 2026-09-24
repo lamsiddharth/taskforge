@@ -1,6 +1,6 @@
 from contextlib import contextmanager
 
-from sqlalchemy import Column, String, create_engine
+from sqlalchemy import Column, Integer, String, create_engine
 from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP, UUID
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
@@ -17,7 +17,7 @@ class Base(DeclarativeBase):
 class TaskModel(Base):
     __tablename__ = "tasks"
 
-    id = Column(UUID, primary_key=True, index=True)
+    id = Column(UUID(as_uuid=False), primary_key=True, index=True)
     task_name = Column(String, nullable=True)
     task_description = Column(String, nullable=True)
     task_status = Column(String, nullable=False, index=True)
@@ -32,6 +32,8 @@ class TaskModel(Base):
     # is an abandoned task.
     worker_id = Column(String, nullable=True, index=True)
     claimed_at = Column(TIMESTAMP(timezone=True), nullable=True)
+    retried_at = Column(TIMESTAMP(timezone=True), nullable=True)
+    retry_count = Column(Integer, nullable=False, default=0)
 
 
 def init_db():
@@ -158,26 +160,63 @@ def get_stale_in_progress_tasks(db):
     )
 
 def get_pending_tasks(db):
-    """Every task currently claimed. The reaper checks each one's worker_id
-    against Redis liveness to decide which are abandoned.
+    """Every PENDING task that hasn't hit the retry ceiling.
+
+    Used by the reaper startup scan to re-enqueue tasks that were reset to
+    PENDING but never reached Redis (reaper crashed mid-recovery).
     """
     return (
         db.query(TaskModel)
-        .filter(TaskModel.task_status == TaskStatus.PENDING.value)
+        .filter(TaskModel.task_status == TaskStatus.PENDING.value, TaskModel.retry_count < settings.max_retries)
         .all()
     )
 
-def reset_abandoned_task(db, task_id: str, new_status: TaskStatus) -> TaskModel | None:
+def reset_abandoned_task(db, task_id: str, new_status: TaskStatus) -> bool:
     """Set status and return the updated row.
 
     Returns the row rather than mutating the caller's Task: the dataclass and
     the DB row are two representations of one entity, and silently letting them
     disagree is how stale reads happen. Callers should use the return value.
     """
-    row = db.query(TaskModel).filter(TaskModel.id == task_id, TaskModel.task_status == TaskStatus.IN_PROGRESS.value).first()
+    row = db.query(TaskModel).filter(
+        TaskModel.id == task_id,
+        TaskModel.task_status == TaskStatus.IN_PROGRESS.value
+    ).update({"task_status": TaskStatus.PENDING.value, "retry_count": TaskModel.retry_count + 1, "retried_at": utcnow()})
+    db.commit()
+    return row > 0
+
+def row_to_task(row: TaskModel) -> Task:
+    """Convert a SQLAlchemy row to a Task dataclass.
+
+    The row is the DB's representation of a task, and the dataclass is the
+    internal representation. They are two representations of one entity, and
+    silently letting them disagree is how stale reads happen. Callers should
+    use the return value.
+    """
+    return Task(
+        id=str(row.id),
+        task_name=row.task_name,
+        task_description=row.task_description,
+        task_status=TaskStatus(row.task_status),
+        task_priority=row.task_priority,
+        task_type=row.task_type,
+        payload=row.payload,
+        created_at=row.created_at,
+        worker_id=row.worker_id,
+        retry_count=row.retry_count,
+        retried_at=row.retried_at
+    )
+def retry_task(db, task_id: str) -> TaskModel | None:
+    """Increment the retry count and set the retried_at timestamp for a task.
+
+    Returns the updated row or None if the task does not exist.
+    """
+    row = db.query(TaskModel).filter(TaskModel.id == task_id).first()
     if row is None:
         return None
-    row.task_status = new_status.value
+    row.retry_count = (row.retry_count or 0) + 1
+    row.retried_at = utcnow()
+    row.task_status = TaskStatus.PENDING.value  # Reset status to PENDING for retry
     db.commit()
     db.refresh(row)
     return row

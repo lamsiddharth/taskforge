@@ -1,0 +1,73 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: taskforge
+      POSTGRES_PASSWORD: taskforge
+      POSTGRES_DB: taskforge
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U taskforge"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  migrate:
+    build: .
+    command: python scripts/migrate.py
+    environment:
+      DATABASE_URL: postgresql://taskforge:taskforge@postgres/taskforge
+      REDIS_HOST: redis
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    build: .
+    command: uvicorn taskforge.api:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://taskforge:taskforge@postgres/taskforge
+      REDIS_HOST: redis
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: .
+    command: python -m taskforge.worker
+    environment:
+      DATABASE_URL: postgresql://taskforge:taskforge@postgres/taskforge
+      REDIS_HOST: redis
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  reaper:
+    build: .
+    command: python -m taskforge.reaper
+    environment:
+      DATABASE_URL: postgresql://taskforge:taskforge@postgres/taskforge
+      REDIS_HOST: redis
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres_data:

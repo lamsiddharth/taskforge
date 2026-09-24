@@ -39,4 +39,6 @@ class TaskRead(BaseModel):
     created_at: datetime
     task_name: Optional[str] = None
     task_description: Optional[str] = None
-    worker_id: Optional[str] = None
+    worker_id: Optional[str] = None,
+    retry_count: int = 0
+    retried_at: Optional[datetime] = None

@@ -1,16 +1,12 @@
-"""Reaper: find tasks whose owning worker died, and make them runnable again.
-
-Detection is implemented below. Recovery is deliberately NOT -- that is step 2.2,
-and the decisions it forces (see the questions at the bottom) are the point.
-"""
+"""Reaper: find tasks whose owning worker died, and make them runnable again."""
 
 import time
 
 from taskforge.config import settings
-from taskforge.database import get_stale_in_progress_tasks, session_scope, get_task, update_task_status, get_pending_tasks, reset_abandoned_task
+from taskforge.database import get_stale_in_progress_tasks, session_scope, get_task, get_pending_tasks, reset_abandoned_task, row_to_task, update_task_status
 from taskforge.worker_registry import WorkerRegistry
-from taskforge.models import TaskStatus, row_to_task
-from taskforge.queue import Task, TaskQueue
+from taskforge.models import TaskStatus
+from taskforge.queue import TaskQueue
 
 def find_abandoned_tasks(registry: WorkerRegistry) -> list[tuple[str, str]]:
     """Tasks sitting IN_PROGRESS whose claiming worker is no longer alive.
@@ -40,7 +36,7 @@ def find_pending_tasks_not_pushed_to_redis(registry: WorkerRegistry) -> list[tup
         for row in get_pending_tasks(db):
             if row.worker_id is None or row.claimed_at is None:
                 continue
-            pending_tasks_not_pushed_to_redis.append((str(row.id), row.worker_id))
+            pending_tasks_not_pushed_to_redis.append((str(row.id), row.worker_id, row))
     return pending_tasks_not_pushed_to_redis
 
 def main() -> None:
@@ -51,39 +47,27 @@ def main() -> None:
     #intial checking for pending tasks that are abandoned
     for task_id, worker_id, task in find_pending_tasks_not_pushed_to_redis(registry):
         print(f"ABANDONED task {task_id} (dead worker {worker_id[:8]})")
-        task_queue.push(row_to_task(get_task(task_id)))
+        task_queue.push(row_to_task(task))
         
     while True:
         for task_id, worker_id in find_abandoned_tasks(registry):
             print(f"ABANDONED task {task_id} (dead worker {worker_id[:8]})")
-            # TODO 2.2 -- recovery. Before writing it, answer:
-            #   1. Reset to PENDING and re-enqueue, or re-enqueue directly?
-            #   2. If the "dead" worker was only stalled and later finishes,
-            #      the task has now run twice. What stops the second copy from
-            #      doing damage? (Hint: not a shorter timeout.)
-            #   3. What happens if the reaper itself crashes between the DB
-            #      write and the Redis push?
-            #   4. Two reaper instances see the same abandoned task. Both
-            #      requeue it. How is that prevented?
-
             with session_scope() as db:
                 task = get_task(db, task_id)
 
-                if task.task_status == TaskStatus.IN_PROGRESS:
-                    updated_row = reset_abandoned_task(db, task_id, "PENDING")
-                    if updated_row is not None:
-                        task_queue.push(row_to_task(updated_row))
-                    print(f"  reset {task_id} to PENDING")
-
-                elif task.task_status is TaskStatus.COMPLETED or task.task_status is TaskStatus.FAILED or task.task_status is TaskStatus.PENDING:
-                    print(f"  SKIP {task_id}: status is {task.task_status}, skipping reset")
-
-                # else:
-                #     updated_row = reset_abandoned_task(db, task_id, "PENDING")
-                #     if updated_row is not None:
-                #         task_queue.push(task)
-                #     print(f"  reset {task_id} to PENDING")
-                    
+                if task.task_status == TaskStatus.IN_PROGRESS.value:
+                    if task.retry_count < settings.max_retries:
+                        if reset_abandoned_task(db, task_id, TaskStatus.PENDING):
+                            fresh = get_task(db, task_id)
+                            task_queue.push(row_to_task(fresh))
+                            print(f"  reset {task_id} to PENDING, re-enqueued")
+                        else:
+                            print(f"  SKIP {task_id}: another reaper already claimed it")
+                    else:
+                        update_task_status(db, task_id, TaskStatus.FAILED)
+                        print(f"  {task_id} -> FAILED (max retries {task.retry_count} reached)")
+                else:
+                    print(f"  SKIP {task_id}: status is {task.task_status}")
 
         time.sleep(settings.reaper_interval)
 

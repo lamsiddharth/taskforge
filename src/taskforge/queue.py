@@ -29,4 +29,8 @@ class TaskQueue:
         result = self.redis_client.brpop(QUEUE_KEY, timeout=0)
         if not result:
             return None
-        return json.loads(result[1], object_hook=task_decoder)
+        try:
+            return json.loads(result[1], object_hook=task_decoder)
+        except Exception as e:
+            print(f"[queue] bad item, discarding: {e} | raw={result[1]!r:.80}")
+            return None

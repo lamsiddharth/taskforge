@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     # 3x tolerates two consecutive misses.
     heartbeat_interval: int = 5
 
+    max_retries: int = 3
+    
     @property
     def worker_ttl(self) -> int:
         return self.heartbeat_interval * 3

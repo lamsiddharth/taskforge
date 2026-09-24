@@ -50,6 +50,7 @@ class TaskStatus(Enum):
     FAILED = "failed"
 
 
+
 @dataclass
 class Task:
     task_priority: str
@@ -64,23 +65,6 @@ class Task:
     # a crashed worker is detected: without it, a crash is indistinguishable
     # from a slow task.
     worker_id: Optional[str] = None
+    retry_count: int = 0
+    retried_at: Optional[datetime] = None
 
-def row_to_task(row) -> Task:
-    """Convert a SQLAlchemy row to a Task dataclass.
-
-    The row is the DB's representation of a task, and the dataclass is the
-    internal representation. They are two representations of one entity, and
-    silently letting them disagree is how stale reads happen. Callers should
-    use the return value.
-    """
-    return Task(
-        id=str(row.id),
-        task_name=row.task_name,
-        task_description=row.task_description,
-        task_status=TaskStatus(row.task_status),
-        task_priority=row.task_priority,
-        task_type=row.task_type,
-        payload=row.payload,
-        created_at=row.created_at,
-        worker_id=row.worker_id,
-    )
