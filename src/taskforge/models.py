@@ -68,3 +68,37 @@ class Task:
     retry_count: int = 0
     retried_at: Optional[datetime] = None
 
+class TriggerType(Enum):
+    CRON = "cron"
+    INTERVAL = "interval"
+    ONCE = "once"
+
+class CatchupPolicy(Enum):
+    """Catchup policy for missed task executions.
+
+    CRON jobs can be missed if the scheduler is down or if the task takes longer
+    than the interval. This policy determines what happens when the scheduler
+    comes back up.
+    """
+    SKIP = "skip"  # skip missed executions
+    FIREONCE = "fireonce"  # fire missed executions immediately
+    CATCHUPALL = "catchupall"  # fire all missed executions in order
+
+@dataclass
+class Schedule:
+    name: str
+    task_type: str
+    payload: dict
+    priority: str
+    trigger_type: TriggerType
+    catchup_policy: CatchupPolicy = CatchupPolicy.SKIP
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    enabled: bool = True
+    run_at: Optional[datetime] = None
+    cron_expression: Optional[str] = None
+    interval_seconds: Optional[int] = None
+    timezone: Optional[str] = "UTC"
+    queue_name: Optional[str] = None
+    description: Optional[str] = None
+    next_run_at: Optional[datetime] = None
+    last_run_at: Optional[datetime] = None

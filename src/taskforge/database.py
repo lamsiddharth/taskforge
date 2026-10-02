@@ -1,6 +1,6 @@
 from contextlib import contextmanager
 
-from sqlalchemy import Column, Integer, String, create_engine
+from sqlalchemy import Column, Integer, String, create_engine, Boolean
 from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP, UUID
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
@@ -35,6 +35,25 @@ class TaskModel(Base):
     retried_at = Column(TIMESTAMP(timezone=True), nullable=True)
     retry_count = Column(Integer, nullable=False, default=0)
 
+class ScheduleModel(Base):
+    __tablename__ = "schedules"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, index=True)
+    name = Column(String, nullable=False,unique=True)
+    description = Column(String, nullable=True)
+    task_type = Column(String, nullable=False)
+    payload = Column(JSONB, nullable=False)
+    priority = Column(String, nullable=False)
+    trigger_type = Column(String, nullable=False)
+    catchup_policy = Column(String, nullable=False, default="skip")
+    enabled = Column(Boolean, nullable=False, default=True)  # 1 for True, 0 for False
+    run_at = Column(TIMESTAMP(timezone=True), nullable=True)
+    cron_expression = Column(String, nullable=True)
+    interval_seconds = Column(Integer, nullable=True)
+    timezone = Column(String, nullable=True, default="UTC")
+    queue_name = Column(String, nullable=True)  # Optional queue name for the task
+    next_run_at = Column(TIMESTAMP(timezone=True), nullable=True, index=True)  # Next scheduled run timeme
+    last_run_at = Column(TIMESTAMP(timezone=True), nullable=True)  # Last run time
 
 def init_db():
     """Create missing tables.
@@ -220,3 +239,10 @@ def retry_task(db, task_id: str) -> TaskModel | None:
     db.commit()
     db.refresh(row)
     return row
+
+def get_schedules(db, enabled: bool | None = None):
+    """Retrieve schedules from the database, optionally filtered by enabled status."""
+    q = db.query(ScheduleModel)
+    if enabled is not None:
+        q = q.filter(ScheduleModel.enabled == enabled)
+    return q.order_by(ScheduleModel.next_run_at.asc()).all()

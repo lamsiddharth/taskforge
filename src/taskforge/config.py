@@ -34,5 +34,6 @@ class Settings(BaseSettings):
 
     reaper_interval: int = 5
 
+    scheduler_interval: int = 10
 
 settings = Settings()
